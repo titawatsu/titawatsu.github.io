@@ -1,0 +1,119 @@
+name: Deploy TipsyWorld leaderboard
+on:
+  workflow_dispatch:
+concurrency:
+  group: account-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      checksum: ${{ steps.snapshot.outputs.checksum }}
+    steps:
+      - name: Check out the account site
+        uses: actions/checkout@v4
+        with:
+          path: account-site
+          persist-credentials: false
+      - name: Check out the canonical snapshot
+        uses: actions/checkout@v4
+        with:
+          repository: titawatsu/tipsyworld-telemetry
+          ref: main
+          path: telemetry
+          sparse-checkout: /leaderboard.json
+          sparse-checkout-cone-mode: false
+          lfs: false
+          persist-credentials: false
+      - name: Prepare both published paths
+        id: snapshot
+        run: |
+          rsync -a --exclude='/.git' --exclude='/.github' account-site/ pages/
+          python - <<'PY'
+          from datetime import datetime
+          from hashlib import sha256
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          snapshot = Path("telemetry/leaderboard.json").read_bytes()
+          document = json.loads(snapshot)
+          published_at = datetime.fromisoformat(document["publishedAtUtc"])
+          if published_at.utcoffset() is None:
+              raise ValueError("The leaderboard timestamp needs a time zone")
+          for field in ("rows", "staffRows"):
+              if not isinstance(document[field], list) or len(document[field]) > 6:
+                  raise ValueError(f"Invalid leaderboard array: {field}")
+
+          for target in (Path("pages/leaderboard.json"), Path("pages/tipsyworld-udonchips/leaderboard.json")):
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(snapshot)
+
+          commit = subprocess.check_output(["git", "-C", "telemetry", "rev-parse", "HEAD"], text=True).strip()
+          print(f"Publishing {commit} with timestamp {published_at.isoformat()}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"checksum={sha256(snapshot).hexdigest()}", file=output)
+          PY
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: pages
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+      - name: Verify the public feeds
+        env:
+          SNAPSHOT_SHA256: ${{ needs.build.outputs.checksum }}
+        run: |
+          python - <<'PY'
+          from hashlib import sha256
+          import os
+          from time import monotonic, sleep
+          from urllib.error import URLError
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+          class DirectResponse(HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          opener = build_opener(DirectResponse())
+          root = "https://titawatsu.github.io"
+          paths = ("/leaderboard.json", "/tipsyworld-udonchips/leaderboard.json")
+          deadline = monotonic() + 180
+          while True:
+              failures = []
+              for path in paths:
+                  request = Request(root + path, headers={"Cache-Control": "no-cache"})
+                  try:
+                      with opener.open(request, timeout=10) as response:
+                          valid = (
+                              response.status == 200
+                              and response.headers.get_content_type() == "application/json"
+                              and sha256(response.read()).hexdigest() == os.environ["SNAPSHOT_SHA256"]
+                          )
+                      if not valid:
+                          failures.append(f"{path}: response does not match the snapshot")
+                  except (URLError, TimeoutError) as error:
+                      failures.append(f"{path}: {error}")
+              if not failures:
+                  print("Both public feeds serve the deployed snapshot")
+                  break
+              if monotonic() >= deadline:
+                  raise SystemExit("\n".join(failures))
+              sleep(10)
+          PY
